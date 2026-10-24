@@ -413,3 +413,59 @@ def test_comments_found_by_shape():
     review = ["id-1", ["Alice", None], 4, None, "Great game, love the cars", [1791961838, 0]]
     ds = {"ds:5": [], "ds:10": [[review, list(review)]], "ds:8": [[["not", "a", "review"]]]}
     assert _find_comments(ds) == ["Great game, love the cars"] * 2
+
+
+# ----------------------------------------------------------------------------- downloads / rollout
+def test_parse_delivery_and_digest():
+    import base64, hashlib
+    from mobile_store_scraper.play.download import _digest_matches, parse_delivery
+    data = encode([
+        (1, 1000), (2, "c2hhMQ"), (3, "https://dl/base"), (19, "c2hhMjU2"),
+        (15, [(1, "config.arm64_v8a"), (2, 200), (4, "x"), (5, "https://dl/split1")]),
+        (15, [(1, "config.xxhdpi"), (2, 50), (5, "https://dl/split2")]),
+        (4, [(1, 0), (2, 6805204), (3, 999), (4, "https://dl/obb")]),
+        (21, [(1, 10), (2, "dm"), (3, "https://dl/dm")]),
+        (5, [(1, "MarketDA"), (2, "abc")]),
+    ])
+    info = parse_delivery(Msg.decode(data), "com.x", 6805204, "px_9a")
+    kinds = [f.kind for f in info.files]
+    assert kinds == ["base", "split", "split", "obb_main", "dex_metadata"]
+    assert info.files[1].filename == "com.x.config.arm64_v8a.apk"
+    assert info.files[3].filename == "main.6805204.com.x.obb"
+    assert info.total_size == 1000 + 200 + 50 + 999 + 10 and info.cookies == {"MarketDA": "abc"}
+    assert "url" not in info.to_dict()["files"][0]          # signed URLs are never persisted
+    d = hashlib.sha1(b"hello").digest()
+    assert _digest_matches(base64.urlsafe_b64encode(d).decode().rstrip("="), d) is True
+    assert _digest_matches(d.hex(), d) is True
+    assert _digest_matches("nope", d) is False and _digest_matches(None, d) is None
+
+
+async def test_download_files_verifies(tmp_path):
+    import base64, hashlib
+    from mobile_store_scraper.play.download import DeliveryFile, DeliveryInfo, download_files
+    body = b"apk-bytes" * 100
+    good = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).decode().rstrip("=")
+
+    def handler(req):
+        return httpx.Response(200, content=body)
+
+    http = _mock_http(handler)
+    info = DeliveryInfo("com.x", 1, "px_9a", [DeliveryFile("base", "base", "com.x.apk", "https://dl/a", len(body), None, good)])
+    paths = await download_files(info, tmp_path, http)
+    assert paths[0].read_bytes() == body and (tmp_path / "delivery.json").exists()
+    bad = DeliveryInfo("com.x", 1, "px_9a", [DeliveryFile("base", "base", "b.apk", "https://dl/b", len(body), None, "zzz")])
+    with pytest.raises(Exception, match="sha256 mismatch"):
+        await download_files(bad, tmp_path, http)
+    assert not (tmp_path / "b.apk").exists() and not (tmp_path / "b.apk.part").exists()
+
+
+def test_watcher_remember_and_state(tmp_path):
+    from mobile_store_scraper.play.rollout import RolloutWatcher
+    w = RolloutWatcher("com.x", tmp_path)
+    st = w._load()
+    assert w._remember(st, 100, "1.0", "main") is True
+    assert w._remember(st, 100, "1.0", "sample:devices") is False
+    assert st["known"]["100"]["sources"] == ["main", "sample:devices"]
+    w._save(st)
+    w._log({"a": 1})
+    assert w._load()["known"]["100"]["version"] == "1.0" and w.log_path.read_text().strip() == '{"a": 1}'

@@ -53,10 +53,76 @@ async def _main(argv: list[str]) -> int:
     return 0
 
 
+async def _tools(argv: list[str]) -> int:
+    """download / sample / watch (Google Play Android API)."""
+    from pathlib import Path
+
+    from .play.api import PlayApiClient
+    from .play.rollout import RolloutWatcher, sample_versions
+    from .play.scraper import default_cache_dir
+
+    ap = argparse.ArgumentParser(prog="mobile-store-scraper")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("download", help="download the exact APK build(s) Play serves")
+    d.add_argument("package")
+    d.add_argument("--vc", type=int, default=None, help="explicit version code (default: what this device is offered)")
+    d.add_argument("--device", default="px_9a")
+    d.add_argument("--dest", default="downloads")
+    d.add_argument("--info", action="store_true", help="only list files/sizes, don't download")
+    s = sub.add_parser("sample", help="ask N independent sessions which build they are offered")
+    s.add_argument("package")
+    s.add_argument("-n", type=int, default=10)
+    s.add_argument("--strategy", choices=["devices", "accounts"], default="devices")
+    s.add_argument("--device", default="px_9a")
+    w = sub.add_parser("watch", help="one rollout-watch check (run it from a scheduler)")
+    w.add_argument("package")
+    w.add_argument("--state-dir", default=str(default_cache_dir() / "watch"))
+    w.add_argument("--download-dir", default=None)
+    w.add_argument("--country", default="US")
+    w.add_argument("--samples", type=int, default=8)
+    w.add_argument("--strategy", choices=["devices", "accounts"], default="devices")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "download":
+        sf = default_cache_dir() / f"play_session_anon_{a.device}.json"
+        async with PlayApiClient(device=a.device, session_file=sf) as c:
+            info = await c.delivery_info(a.package, a.vc)
+            print(f"{info.package} versionCode={info.version_code} device={info.device} "
+                  f"files={len(info.files)} total={info.total_size / 1e6:.1f} MB")
+            for f in info.files:
+                print(f"  {f.kind:13} {f.filename:60} {(f.size or 0) / 1e6:9.1f} MB")
+            if not a.info:
+                from .play.download import download_files
+                last = {}
+
+                def prog(name, done, total):
+                    pct = int(done * 100 / total) if total else 0
+                    if last.get(name) != pct // 10:
+                        last[name] = pct // 10
+                        print(f"    {name}: {pct}%", flush=True)
+
+                paths = await download_files(info, Path(a.dest) / a.package / str(info.version_code), c.http,
+                                             progress=prog)
+                print("saved + verified:", *[str(p) for p in paths], sep="\n  ")
+    elif a.cmd == "sample":
+        rep = await sample_versions(a.package, a.n, strategy=a.strategy, device=a.device)
+        print(json.dumps(rep.summary(), indent=2))
+        for smp in rep.samples:
+            print(f"  account={smp.account} gsf={smp.gsf_id} -> {smp.version} ({smp.version_code}) {smp.error or ''}")
+    else:
+        entry = await RolloutWatcher(a.package, a.state_dir, country=a.country, samples=a.samples,
+                                     strategy=a.strategy, download_dir=a.download_dir).check()
+        print(json.dumps(entry, indent=2, default=str))
+    return 0
+
+
 def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    sys.exit(asyncio.run(_main(sys.argv[1:])))
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("download", "sample", "watch"):
+        sys.exit(asyncio.run(_tools(argv)))
+    sys.exit(asyncio.run(_main(argv)))
 
 
 if __name__ == "__main__":

@@ -411,6 +411,65 @@ class PlayApiClient:
         return out
 
 
+    # ----------------------------------------------------------------- downloads
+    async def purchase(self, package: str, version_code: int) -> Optional[str]:
+        """'Buy' a free app (adds it to the account's library); returns the delivery token if any.
+
+        Raises ``VersionNotAvailable`` when Play refuses this version code for this account/device.
+        """
+        from .download import VersionNotAvailable
+        resp, w = await self._authed("POST", "purchase", params={"ot": "1", "doc": package, "vc": str(version_code)},
+                                     content=b"", extra_headers={"Content-Length": "0"})
+        if resp.status_code == 404:
+            raise AppNotFound(package, store="google_play")
+        err = self._error_text(w)
+        if resp.status_code != 200:
+            raise VersionNotAvailable(f"purchase {package}@{version_code} -> HTTP {resp.status_code}: {err}")
+        buy = w.msg(1).msg(4)
+        return buy.str(55) or None
+
+    async def delivery_info(self, package: str, version_code: Optional[int] = None):
+        """Exact files (base/split APKs, OBBs, dex metadata) Play serves for ``version_code``.
+
+        ``version_code=None`` means the code this session is currently offered (``details``).
+        """
+        from .download import VersionNotAvailable, parse_delivery
+        if version_code is None:
+            d = await self.details(package)
+            if not d.version_code:
+                raise VersionNotAvailable(f"{package} is not offered to device {self.profile.name}")
+            version_code = d.version_code
+        dtok = await self.purchase(package, version_code)
+        params = {"ot": "1", "doc": package, "vc": str(version_code)}
+        if dtok:
+            params["dtok"] = dtok
+        resp, w = await self._authed("GET", "delivery", params=params)
+        data = w.msg(1).msg(21).msg(2)
+        if resp.status_code != 200 or not data:
+            status = w.msg(1).msg(21).int(1)
+            raise VersionNotAvailable(f"delivery {package}@{version_code} -> HTTP {resp.status_code}, "
+                                      f"status={status}: {self._error_text(w) or 'no delivery data'}")
+        return parse_delivery(data, package, version_code, self.profile.name)
+
+    async def download(self, package: str, dest, version_code: Optional[int] = None, **kw):
+        """Resolve + download + verify. Returns ``(DeliveryInfo, [paths])``."""
+        from pathlib import Path as _P
+        from .download import download_files
+        info = await self.delivery_info(package, version_code)
+        paths = await download_files(info, _P(dest), self.http, **kw)
+        return info, paths
+
+    @property
+    def identity(self) -> dict:
+        """Who Play thinks we are (for rollout sampling logs). Email is hashed."""
+        import hashlib
+        s = self.session
+        if not s:
+            return {}
+        return {"account": hashlib.sha256(s.email.encode()).hexdigest()[:12] if s.email else None,
+                "gsf_id": f"{s.gsf_id:x}", "device": s.device}
+
+
 def parse_details_response(data: bytes, device: str = "") -> Optional[PlayApiDetails]:
     """Parse a raw ``fdfe/details`` response body (useful for fixtures/tests)."""
     return _item_to_details(Msg.decode(data).msg(1).msg(2).msg(4), device)
