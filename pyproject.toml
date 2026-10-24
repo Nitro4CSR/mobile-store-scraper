@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mobile-store-scraper"
+version = "0.1.0"
+description = "Async Google Play + Apple App Store scraper with reliable versions (incl. 'Varies with device' app bundles), unified UTC update dates and every storefront country."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT AND GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Nitro4CSR" }]
+keywords = ["google play", "app store", "scraper", "asyncio", "apk", "version", "itunes"]
+classifiers = [
+  "Framework :: AsyncIO",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Topic :: Internet :: WWW/HTTP",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+]
+dependencies = ["httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/Nitro4CSR/mobile-store-scraper"
+Repository = "https://github.com/Nitro4CSR/mobile-store-scraper"
+Issues = "https://github.com/Nitro4CSR/mobile-store-scraper/issues"
+
+[project.optional-dependencies]
+http2 = ["httpx[http2]>=0.27"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+mobile-store-scraper = "mobile_store_scraper.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mobile_store_scraper"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/mobile_store_scraper", "tests", "bench/bench.py", "bench/capture_fixtures.py", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["live: hits the real stores (run with -m live)"]
+addopts = "-m 'not live'"

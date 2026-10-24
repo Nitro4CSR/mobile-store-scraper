@@ -1,0 +1,38 @@
+name: publish
+# Publishes to PyPI with Trusted Publishing (no API token stored anywhere).
+# One-time setup on pypi.org: Account -> Publishing -> "Add a new pending publisher"
+#   PyPI project name: mobile-store-scraper | Owner/Repository: Nitro4CSR/mobile-store-scraper
+#   Workflow name: publish.yml | Environment name: pypi
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mobile-store-scraper
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
