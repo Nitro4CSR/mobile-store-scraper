@@ -141,14 +141,28 @@ mobile-store-scraper report com.naturalmotion.customstreetracer2 --state-dir wat
 
 ### Raspberry Pi (log-only watcher)
 
-On Raspberry Pi OS Bookworm or newer (Python 3.10+):
+The installer leaves the system Python alone and needs no `sudo`, `apt`, `git` or systemd:
+
+* It creates its own venv (`~/storewatchenv`) with the newest `python3.N` in `/usr/local/bin`, or with `PYTHON=/usr/local/bin/python3.14`.
+* It writes a helper script, `~/store_watch.sh`.
+* It adds one line per app to your user's crontab. Your other crontab lines are kept, and the old crontab is backed up first.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/Nitro4CSR/mobile-store-scraper/main/deploy/raspberry-pi/install.sh -o install.sh
-PACKAGE=com.naturalmotion.customstreetracer2 INTERVAL='*:0/30' SAMPLES=6 COUNTRY=DE bash install.sh
+PACKAGE=com.naturalmotion.customstreetracer2 COUNTRY=DE SAMPLES=6 EVERY_MIN=30 bash install.sh
+
+~/store_watch.sh report    # every build seen + when it was first seen and how
+~/store_watch.sh log       # today's run log (~/logs/store_watch_YYYY-MM-DD.log)
+~/store_watch.sh status    # crontab line + data files
 ```
 
-This installs a systemd timer that runs the check every 30 minutes. The timer survives reboots and catches up on runs it missed while the Pi was off. When you notice a new release, run `report` to see when the watcher first saw it and how (`main`, `sample:devices` or `probe_by_code`).
+Other options:
+* `NO_CRON=1` skips scheduling.
+* `VENV_PATH`, `DATA_DIR` and `LOG_DIR` move things.
+* `REF=<branch>` installs from GitHub instead of PyPI.
+* Running the installer again with another `PACKAGE` watches a second app.
+
+When you notice a new release, `report` shows when the watcher first saw it and how (`main`, `sample:devices` or `probe_by_code`).
 
 ## CLI
 

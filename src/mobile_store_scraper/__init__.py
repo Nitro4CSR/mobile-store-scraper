@@ -8,7 +8,7 @@
 from .appstore import AppStore
 from .countries import ALL_COUNTRIES, APP_STORE_COUNTRIES, PLAY_COUNTRIES
 from .dates import to_iso
-from .errors import (AppNotFound, InvalidCountry, IpBlocked, ParseError, PlayApiError, PlayAuthError, RateLimited,
+from .errors import (AppNotFound, InvalidCountry, IpBlocked, NetworkError, ParseError, PlayApiError, PlayAuthError, RateLimited,
                      StoreScraperError)
 from .http import HttpClient
 from .models import AppData, AppStoreApp, DeviceVersion, GooglePlayApp, Store, VersionSource
@@ -26,6 +26,6 @@ __all__ = [
     "AppData", "GooglePlayApp", "AppStoreApp", "DeviceVersion", "Store", "VersionSource",
     "PLAY_COUNTRIES", "APP_STORE_COUNTRIES", "ALL_COUNTRIES",
     "DEFAULT_DEVICE", "REPRESENTATIVE_DEVICES", "available_devices", "to_iso",
-    "StoreScraperError", "AppNotFound", "IpBlocked", "InvalidCountry", "ParseError", "RateLimited",
+    "StoreScraperError", "AppNotFound", "IpBlocked", "NetworkError", "InvalidCountry", "ParseError", "RateLimited",
     "PlayAuthError", "PlayApiError", "__version__",
 ]

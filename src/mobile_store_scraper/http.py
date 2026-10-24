@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .errors import IpBlocked, RateLimited
+from .errors import IpBlocked, NetworkError, RateLimited
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -174,7 +174,7 @@ class HttpClient:
                 raise RateLimited(f"{method} {url} -> 429 after {self.retries} retries")
             return resp
         assert last_exc is not None
-        raise last_exc
+        raise NetworkError(f"{method} {url}: {type(last_exc).__name__}: {last_exc}") from last_exc
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)

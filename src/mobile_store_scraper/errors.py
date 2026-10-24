@@ -33,6 +33,10 @@ class IpBlocked(RateLimited):
     """
 
 
+class NetworkError(StoreScraperError):
+    """The host could not be reached (DNS, TLS, proxy, timeout...) after all retries."""
+
+
 class ParseError(StoreScraperError):
     """The store answered, but the payload did not have the expected shape."""
 

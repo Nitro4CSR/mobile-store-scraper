@@ -519,3 +519,15 @@ async def test_watcher_check_logs_new_build(tmp_path, monkeypatch):
     assert csv[0].startswith("time_utc,source") and any("6905101" in line for line in csv)
     e2 = await w.check()
     assert e2["new_builds"] == []
+
+
+
+async def test_network_failure_becomes_networkerror():
+    from mobile_store_scraper import NetworkError
+
+    def handler(req):
+        raise httpx.ConnectError("no route")
+
+    http = HttpClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)), retries=1, backoff=0)
+    with pytest.raises(NetworkError, match="ConnectError"):
+        await http.get("https://play.google.com/x")
