@@ -75,6 +75,7 @@ async def sample_versions(
     http: Optional[HttpClient] = None,
     dispenser_url: Optional[str] = None,
     keep_sessions: Optional[Path] = None,
+    base_client: Optional[PlayApiClient] = None,
 ) -> SampleReport:
     """Ask ``n`` independent Play sessions which build of ``package`` they are offered.
 
@@ -88,7 +89,9 @@ async def sample_versions(
     extra = {"dispenser_url": dispenser_url} if dispenser_url else {}
     base: Optional[PlayApiClient] = None
     if strategy == "devices":
-        base = PlayApiClient(device=device, http=http, **extra)
+        # one account (reuse the caller's logged-in session if given: no extra dispenser call),
+        # a brand-new device check-in per sample
+        base = base_client or PlayApiClient(device=device, http=http, **extra)
         await base.login()
     elif strategy != "accounts":
         raise ValueError("strategy must be 'devices' or 'accounts'")
@@ -157,7 +160,8 @@ class RolloutWatcher:
 
     def __init__(self, package: str, state_dir: Union[str, Path], *, country: str = "US",
                  device: str = DEFAULT_DEVICE, samples: int = 8, strategy: str = "devices",
-                 download_dir: Union[str, Path, None] = None, active_days: float = 10.0) -> None:
+                 download_dir: Union[str, Path, None] = None, active_days: float = 10.0,
+                 always_sample: bool = False, probe: bool = True) -> None:
         self.package = package
         self.state_dir = Path(state_dir)
         self.country = country
@@ -166,8 +170,28 @@ class RolloutWatcher:
         self.strategy = strategy
         self.download_dir = Path(download_dir) if download_dir else None
         self.active_days = active_days
+        self.always_sample = always_sample
+        self.probe = probe
         self.state_path = self.state_dir / f"{package}.state.json"
         self.log_path = self.state_dir / f"{package}.log.jsonl"
+        self.obs_path = self.state_dir / f"{package}.observations.csv"
+
+    def _observe(self, time_: str, source: str, version: Optional[str], code: Optional[int],
+                 account: Optional[str] = None, gsf_id: Optional[str] = None, extra: str = "") -> None:
+        """One CSV line per thing we saw - easy to grep/open in Excel later."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        new = not self.obs_path.exists()
+        with open(self.obs_path, "a", encoding="utf-8", newline="") as fh:
+            if new:
+                fh.write("time_utc,source,version,version_code,account,gsf_id,extra\n")
+            fields = [time_, source, version or "", str(code or ""), account or "", gsf_id or "", extra]
+            fh.write(",".join(f.replace(",", ";") for f in fields) + "\n")
+
+    def report(self) -> list[dict[str, Any]]:
+        """Every build ever seen, oldest first: version, code, first/last seen, how it was found."""
+        st = self._load()
+        rows = [{"version_code": int(k), **v} for k, v in st["known"].items()]
+        return sorted(rows, key=lambda r: r["version_code"])
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -191,6 +215,8 @@ class RolloutWatcher:
         k = str(code)
         new = k not in st["known"]
         rec = st["known"].setdefault(k, {"version": version, "first_seen": _now(), "sources": []})
+        rec["last_seen"] = _now()
+        rec.setdefault("first_source", source)
         if source not in rec["sources"]:
             rec["sources"].append(source)
         return new
@@ -198,6 +224,7 @@ class RolloutWatcher:
     async def check(self) -> dict[str, Any]:
         from .scraper import GooglePlay  # local import: avoid cycle
         st = self._load()
+        known_before = set(st["known"])
         entry: dict[str, Any] = {"time": _now(), "package": self.package}
         t0 = time.monotonic()
         sessions = self.state_dir / "sessions"
@@ -206,6 +233,8 @@ class RolloutWatcher:
             try:
                 web = await gp.app(self.package, self.country, version_mode="web")
                 entry["web"] = {"version": web.version, "last_updated": web.last_updated}
+                self._observe(entry["time"], f"web:{self.country}", web.version, None,
+                              extra=f"listing_updated={web.last_updated}")
             except StoreScraperError as exc:
                 web = None
                 entry["web"] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -215,6 +244,8 @@ class RolloutWatcher:
                 d = await main.details(self.package)
                 entry["main"] = {"version": d.version, "version_code": d.version_code, **main.identity}
                 self._remember(st, d.version_code, d.version, "main")
+                self._observe(entry["time"], "main", d.version, d.version_code, main.identity.get("account"),
+                              main.identity.get("gsf_id"), extra=f"build_date={d.updated_raw}")
             except StoreScraperError as exc:
                 d = None
                 entry["main"] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -237,22 +268,27 @@ class RolloutWatcher:
 
             # 4) sample while a rollout looks active (or on the very first run, as a baseline)
             first_run = not st.get("sampled_once")
-            if st.get("active_since") or first_run:
+            if self.samples > 0 and (self.always_sample or st.get("active_since") or first_run):
                 rep = await sample_versions(self.package, self.samples, strategy=self.strategy, device=self.device,
-                                            keep_sessions=sessions)
+                                            keep_sessions=sessions if self.download_dir else None,
+                                            base_client=main if (self.strategy == "devices" and d) else None)
                 entry["sampling"] = rep.summary()
                 st["sampled_once"] = True
                 for s in rep.samples:
                     self._remember(st, s.version_code, s.version, f"sample:{self.strategy}")
+                    self._observe(entry["time"], f"sample:{self.strategy}", s.version, s.version_code,
+                                  s.account, s.gsf_id, extra=s.error or "")
                 if rep.newest and main_code and rep.newest.version_code > main_code:
                     st["active_since"] = st.get("active_since") or _now()
 
             # 5) probe the newest known code from the main session (does asking by code work?)
             newest = max((int(k) for k in st["known"]), default=None)
-            if newest and main_code and newest > main_code:
+            if self.probe and newest and main_code and newest > main_code:
                 entry["probe"] = await probe_version_code(main, self.package, newest)
                 if entry["probe"]["available"]:
                     self._remember(st, newest, st["known"][str(newest)]["version"], "probe_by_code")
+                self._observe(entry["time"], "probe_by_code", st["known"][str(newest)]["version"], newest,
+                              extra="available" if entry["probe"]["available"] else entry["probe"].get("error", ""))
 
             # 6) download builds we haven't stored yet
             if self.download_dir and newest and str(newest) not in st["downloaded"]:
@@ -261,6 +297,7 @@ class RolloutWatcher:
                     st["downloaded"].append(str(newest))
 
         entry["newest_known"] = newest
+        entry["new_builds"] = sorted(set(st["known"]) - known_before, key=int)
         entry["seconds"] = round(time.monotonic() - t0, 1)
         self._save(st)
         self._log(entry)

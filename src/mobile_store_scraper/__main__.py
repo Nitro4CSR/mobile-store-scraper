@@ -81,6 +81,11 @@ async def _tools(argv: list[str]) -> int:
     w.add_argument("--country", default="US")
     w.add_argument("--samples", type=int, default=8)
     w.add_argument("--strategy", choices=["devices", "accounts"], default="devices")
+    w.add_argument("--always-sample", action="store_true", help="sample on every run (not only during rollouts)")
+    w.add_argument("--no-probe", action="store_true", help="don't ask Play for newer codes by number")
+    r = sub.add_parser("report", help="list every build the watcher has seen, with first-seen times")
+    r.add_argument("package")
+    r.add_argument("--state-dir", default=str(default_cache_dir() / "watch"))
     a = ap.parse_args(argv)
 
     if a.cmd == "download":
@@ -109,9 +114,18 @@ async def _tools(argv: list[str]) -> int:
         print(json.dumps(rep.summary(), indent=2))
         for smp in rep.samples:
             print(f"  account={smp.account} gsf={smp.gsf_id} -> {smp.version} ({smp.version_code}) {smp.error or ''}")
+    elif a.cmd == "report":
+        rows = RolloutWatcher(a.package, a.state_dir).report()
+        print(f"{'version_code':>12}  {'version':12} {'first_seen (UTC)':21} {'last_seen (UTC)':21} first found by")
+        for r_ in rows:
+            print(f"{r_['version_code']:>12}  {str(r_.get('version')):12} {r_.get('first_seen', ''):21} "
+                  f"{r_.get('last_seen', ''):21} {r_.get('first_source', (r_.get('sources') or [''])[0])}")
+        if not rows:
+            print("(nothing logged yet)")
     else:
         entry = await RolloutWatcher(a.package, a.state_dir, country=a.country, samples=a.samples,
-                                     strategy=a.strategy, download_dir=a.download_dir).check()
+                                     strategy=a.strategy, download_dir=a.download_dir,
+                                     always_sample=a.always_sample, probe=not a.no_probe).check()
         print(json.dumps(entry, indent=2, default=str))
     return 0
 
@@ -120,7 +134,7 @@ def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     argv = sys.argv[1:]
-    if argv and argv[0] in ("download", "sample", "watch"):
+    if argv and argv[0] in ("download", "sample", "watch", "report"):
         sys.exit(asyncio.run(_tools(argv)))
     sys.exit(asyncio.run(_main(argv)))
 

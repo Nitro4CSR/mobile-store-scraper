@@ -469,3 +469,53 @@ def test_watcher_remember_and_state(tmp_path):
     w._save(st)
     w._log({"a": 1})
     assert w._load()["known"]["100"]["version"] == "1.0" and w.log_path.read_text().strip() == '{"a": 1}'
+
+
+async def test_watcher_check_logs_new_build(tmp_path, monkeypatch):
+    """Full check() with the network mocked: main sees old build, a sampled device sees the new one."""
+    from mobile_store_scraper.play import rollout
+    from mobile_store_scraper.play.api import PlayApiClient, PlayApiDetails
+    from mobile_store_scraper.play.scraper import GooglePlay
+
+    def det(v, code):
+        return PlayApiDetails("com.x", "X", "Dev", v, code, None, "Oct 14, 2026", 36, "1M", "px_9a")
+
+    async def fake_app(self, app_id, country="US", **kw):
+        raise mss_err("web blocked")
+
+    from mobile_store_scraper.errors import IpBlocked as mss_err
+    monkeypatch.setattr(GooglePlay, "app", fake_app)
+
+    async def fake_details(self, package):
+        return det("6.8.0", 6805204)
+
+    monkeypatch.setattr(PlayApiClient, "details", fake_details)
+
+    async def fake_login(self, force=False):
+        return None
+
+    monkeypatch.setattr(PlayApiClient, "login", fake_login)
+
+    async def fake_sample(package, n, **kw):
+        rep = rollout.SampleReport(package, "devices")
+        rep.samples = [rollout.Sample("devices", "px_9a", "acc", "g1", "6.8.0", 6805204),
+                       rollout.Sample("devices", "px_9a", "acc", "g2", "6.9.0", 6905101)]
+        return rep
+
+    monkeypatch.setattr(rollout, "sample_versions", fake_sample)
+
+    async def fake_probe(client, package, code):
+        return {"version_code": code, "available": True, "files": 3, "total_size": 1}
+
+    monkeypatch.setattr(rollout, "probe_version_code", fake_probe)
+    w = rollout.RolloutWatcher("com.x", tmp_path, always_sample=True, samples=2)
+    e = await w.check()
+    assert e["new_builds"] == ["6805204", "6905101"] and e["newest_known"] == 6905101
+    assert e["probe"]["available"] is True and "error" in e["web"]
+    rows = w.report()
+    assert [r["version_code"] for r in rows] == [6805204, 6905101]
+    assert rows[1]["first_source"] == "sample:devices" and "probe_by_code" in rows[1]["sources"]
+    csv = w.obs_path.read_text().splitlines()
+    assert csv[0].startswith("time_utc,source") and any("6905101" in line for line in csv)
+    e2 = await w.check()
+    assert e2["new_builds"] == []

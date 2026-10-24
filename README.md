@@ -101,6 +101,55 @@ The API is logged into anonymously with a token from Aurora Store's community di
 
 `scrape_countries()` returns `{country: result | AppNotFound | other exception}`. The Play API is called once per device, not once per country.
 
+## Download exact APK builds (Google Play)
+
+```
+mobile-store-scraper download com.google.android.calculator            # what a Pixel 9a is offered
+mobile-store-scraper download com.example.app --device px_tablet --info # list files/sizes only
+mobile-store-scraper download com.example.app --vc 6805204              # ask for a specific version code
+```
+
+Each download contains the base APK, the split APKs (ABI / density / language), any OBB files and dex metadata. Every file is checked against the size and SHA-1/SHA-256 that Play reports. In Python:
+
+```python
+from mobile_store_scraper import PlayApiClient
+async with PlayApiClient(device="px_9a") as c:
+    info, paths = await c.download("com.example.app", "downloads/")
+```
+
+Limits:
+* Only free apps, or apps the logged-in account owns.
+* Play only serves currently live version codes, so old builds can't be fetched.
+* Play Asset Delivery packs (large game content) are not downloaded yet.
+
+## Catching staged rollouts
+
+Play rolls a new build out to a growing share of accounts/devices. The tools below log what independent sessions are offered and when:
+
+```
+mobile-store-scraper sample com.naturalmotion.customstreetracer2 -n 10                 # fresh device ids, one account
+mobile-store-scraper sample com.naturalmotion.customstreetracer2 -n 5 --strategy accounts
+mobile-store-scraper watch  com.naturalmotion.customstreetracer2 --state-dir watch --always-sample
+mobile-store-scraper report com.naturalmotion.customstreetracer2 --state-dir watch       # first-seen time per build
+```
+
+`watch` performs one check and is meant to run from a scheduler:
+* It logs every observation to `<package>.observations.csv`.
+* It tracks every build ever seen in `<package>.state.json`.
+* It asks Play for the newest known version code by number (`--no-probe` disables this).
+* It downloads new builds only when you pass `--download-dir`.
+
+### Raspberry Pi (log-only watcher)
+
+On Raspberry Pi OS Bookworm or newer (Python 3.10+):
+
+```
+curl -fsSL https://raw.githubusercontent.com/Nitro4CSR/mobile-store-scraper/main/deploy/raspberry-pi/install.sh -o install.sh
+PACKAGE=com.naturalmotion.customstreetracer2 INTERVAL='*:0/30' SAMPLES=6 COUNTRY=DE bash install.sh
+```
+
+This installs a systemd timer that runs the check every 30 minutes. The timer survives reboots and catches up on runs it missed while the Pi was off. When you notice a new release, run `report` to see when the watcher first saw it and how (`main`, `sample:devices` or `probe_by_code`).
+
 ## CLI
 
 ```
