@@ -514,7 +514,7 @@ async def test_watcher_check_logs_new_build(tmp_path, monkeypatch):
     assert e["probe"]["available"] is True and "error" in e["web"]
     rows = w.report()
     assert [r["version_code"] for r in rows] == [6805204, 6905101]
-    assert rows[1]["first_source"] == "sample:devices" and "probe_by_code" in rows[1]["sources"]
+    assert rows[1]["first_source"] == "sample:accounts" and "probe_by_code" in rows[1]["sources"]
     csv = w.obs_path.read_text().splitlines()
     assert csv[0].startswith("time_utc,source") and any("6905101" in line for line in csv)
     e2 = await w.check()
@@ -531,3 +531,89 @@ async def test_network_failure_becomes_networkerror():
     http = HttpClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)), retries=1, backoff=0)
     with pytest.raises(NetworkError, match="ConnectError"):
         await http.get("https://play.google.com/x")
+
+
+
+# ----------------------------------------------------------------------------- fetch_build (retry until delivered)
+class _FakeClient:
+    """Stands in for PlayApiClient: rate limited ``fail`` times, then delivers one small file."""
+
+    def __init__(self, fail, body):
+        from mobile_store_scraper.play.download import DeliveryFile, DeliveryInfo
+        import base64, hashlib
+        self.http = HttpClient(httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=body))))
+        self.fail, self.calls, self.http_seen = fail, 0, []
+        sha = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).decode().rstrip("=")
+        self.info = DeliveryInfo("com.x", 42, "px_9a", [DeliveryFile("base", "base", "com.x.apk", "https://dl/x", len(body), None, sha)])
+
+    async def delivery_info(self, package, code):
+        from mobile_store_scraper import RateLimited
+        self.calls += 1
+        self.http_seen.append(self.http.retries)
+        if self.calls <= self.fail:
+            raise RateLimited("429")
+        return self.info
+
+
+async def test_fetch_build_retries_then_downloads(tmp_path):
+    from mobile_store_scraper.play.download import already_downloaded, fetch_build
+    c = _FakeClient(fail=2, body=b"x" * 1000)
+    original_http = c.http
+    msgs = []
+    info, paths = await fetch_build(c, "com.x", 42, tmp_path / "42", wait_hours=1, interval=0.01, log=msgs.append)
+    assert c.calls == 3 and paths[0].read_bytes() == b"x" * 1000
+    assert c.http_seen == [1, 1, 1]          # every attempt used the quick (1-retry) client
+    assert c.http is original_http          # and the client's own HttpClient is restored
+    assert len(msgs) == 3 and "delivery OK" in msgs[-1]
+    assert already_downloaded(tmp_path / "42", 42) == paths
+    # second call: nothing requested, existing verified copy returned
+    c2 = _FakeClient(fail=0, body=b"x" * 1000)
+    info2, paths2 = await fetch_build(c2, "com.x", 42, tmp_path / "42")
+    assert info2 is None and paths2 == paths and c2.calls == 0
+
+
+async def test_fetch_build_gives_up_when_time_runs_out(tmp_path):
+    from mobile_store_scraper import RateLimited
+    from mobile_store_scraper.play.download import fetch_build
+    c = _FakeClient(fail=99, body=b"y")
+    with pytest.raises(RateLimited):
+        await fetch_build(c, "com.x", 42, tmp_path, wait_hours=0.0001, interval=0.2)
+    assert c.calls >= 1 and not (tmp_path / "com.x.apk").exists()
+
+
+async def test_watcher_download_uses_fetch_and_skips_existing(tmp_path, monkeypatch):
+    from mobile_store_scraper.play import download as dl
+    from mobile_store_scraper.play.rollout import RolloutWatcher
+    calls = []
+
+    async def fake_fetch(client, package, code, dest, **kw):
+        calls.append(code)
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "a.apk").write_bytes(b"1")
+        (dest / "delivery.json").write_text(json.dumps({"version_code": code, "verified": True,
+                                                         "files": [{"filename": "a.apk", "size": 1}]}))
+        return None, [dest / "a.apk"]
+
+    monkeypatch.setattr(dl, "fetch_build", fake_fetch)
+    w = RolloutWatcher("com.x", tmp_path / "state", download_dir=tmp_path / "dl")
+    r1 = await w._download(None, 6905206, tmp_path)
+    r2 = await w._download(None, 6905206, tmp_path)
+    assert r1["ok"] and r2 == {"ok": True, "dest": str(tmp_path / "dl" / "com.x" / "6905206"), "note": "already downloaded"}
+    assert calls == [6905206]
+
+
+
+async def test_fetch_build_rotates_anonymous_account(tmp_path):
+    from mobile_store_scraper.play.download import fetch_build
+    c = _FakeClient(fail=3, body=b"z" * 10)
+    c.anonymous, c.logins = True, 0
+
+    async def login(force=False):
+        c.logins += 1
+
+    c.login = login
+    c.identity = {"account": "new", "gsf_id": "g"}
+    msgs = []
+    info, paths = await fetch_build(c, "com.x", 42, tmp_path, wait_hours=1, interval=0.01, rotate_after=2, log=msgs.append)
+    assert c.calls == 4 and c.logins == 1 and paths
+    assert any("switching to a fresh account" in m for m in msgs) and any("now using account new" in m for m in msgs)

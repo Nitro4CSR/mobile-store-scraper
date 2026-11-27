@@ -4,7 +4,9 @@ During a staged rollout Play decides per account/device who gets the new build, 
 session usually still sees the old one. Three tools:
 
 * :func:`sample_versions` - ask Play from many independent sessions and tally what each sees.
-  ``strategy="accounts"``: a fresh anonymous dispenser account per sample.
+  ``strategy="accounts"``: a fresh anonymous dispenser account per sample (default - Play
+  decides staged rollouts PER ACCOUNT: with CSR2 6.9.0, 25/25 fresh devices on one account got
+  the old build while 5/10 fresh accounts got the new one).
   ``strategy="devices"``: one account, a fresh device check-in (new GSF id) per sample.
 * :func:`probe_version_code` - ask Play to deliver a *specific* version code to one session.
   If Play serves rollout builds to anyone who asks by code, this needs no luck at all.
@@ -135,14 +137,27 @@ def client_from_session_file(path: Union[str, Path], http: Optional[HttpClient] 
     return c
 
 
-async def probe_version_code(client: PlayApiClient, package: str, version_code: int) -> dict[str, Any]:
-    """Can this session get ``version_code`` by asking for it explicitly? (no download)"""
+async def probe_version_code(client: PlayApiClient, package: str, version_code: int,
+                             quick: bool = True) -> dict[str, Any]:
+    """Can this session get ``version_code`` by asking for it explicitly? (no download)
+
+    Play serves a build that is mid-rollout to ANY account that asks by number (verified live
+    with CSR2 6.9.0, Nov 2026). ``quick`` = one attempt, no long 429 back-off.
+    """
+    original = client.http
+    fast = HttpClient(retries=1, backoff=2.0) if quick else None
+    if fast:
+        client.http = fast
     try:
         info = await client.delivery_info(package, version_code)
         return {"version_code": version_code, "available": True, "files": len(info.files),
                 "total_size": info.total_size}
     except StoreScraperError as exc:
         return {"version_code": version_code, "available": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        client.http = original
+        if fast:
+            await fast.aclose()
 
 
 def _now() -> str:
@@ -159,9 +174,9 @@ class RolloutWatcher:
     """
 
     def __init__(self, package: str, state_dir: Union[str, Path], *, country: str = "US",
-                 device: str = DEFAULT_DEVICE, samples: int = 8, strategy: str = "devices",
+                 device: str = DEFAULT_DEVICE, samples: int = 4, strategy: str = "accounts",
                  download_dir: Union[str, Path, None] = None, active_days: float = 10.0,
-                 always_sample: bool = False, probe: bool = True) -> None:
+                 always_sample: bool = False, probe: bool = True, download_wait_minutes: float = 10.0) -> None:
         self.package = package
         self.state_dir = Path(state_dir)
         self.country = country
@@ -171,6 +186,7 @@ class RolloutWatcher:
         self.download_dir = Path(download_dir) if download_dir else None
         self.active_days = active_days
         self.always_sample = always_sample
+        self.download_wait_minutes = download_wait_minutes
         self.probe = probe
         self.state_path = self.state_dir / f"{package}.state.json"
         self.log_path = self.state_dir / f"{package}.log.jsonl"
@@ -304,18 +320,20 @@ class RolloutWatcher:
         return entry
 
     async def _download(self, main: PlayApiClient, code: int, sessions: Path) -> dict[str, Any]:
+        """Fetch ``code`` by number (works for any account); skips builds already on disk."""
+        from .download import already_downloaded, fetch_build
         dest = self.download_dir / self.package / str(code)
-        tried = []
-        candidates = [main] + [client_from_session_file(p, main.http)
-                               for p in sorted(sessions.glob(f"{self.package}_{code}_*.json"))]
-        for c in candidates[:4]:
-            try:
-                info, paths = await c.download(self.package, dest, code)
-                return {"ok": True, "dest": str(dest), "files": [p.name for p in paths], "bytes": info.total_size,
-                        "via": "main" if c is main else "sampled_session"}
-            except StoreScraperError as exc:
-                tried.append(f"{type(exc).__name__}: {exc}")
-        return {"ok": False, "errors": tried}
+        if already_downloaded(dest, code):
+            return {"ok": True, "dest": str(dest), "note": "already downloaded"}
+        notes: list[str] = []
+        try:
+            info, paths = await fetch_build(main, self.package, code, dest,
+                                            wait_hours=self.download_wait_minutes / 60, interval=60,
+                                            log=notes.append)
+            return {"ok": True, "dest": str(dest), "files": [p.name for p in paths],
+                    "bytes": info.total_size if info else None, "attempts": len(notes) + 1}
+        except StoreScraperError as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "attempts": len(notes) + 1}
 
 
 __all__ = ["Sample", "SampleReport", "sample_versions", "probe_version_code", "client_from_session_file",

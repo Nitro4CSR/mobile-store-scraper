@@ -69,18 +69,24 @@ async def _tools(argv: list[str]) -> int:
     d.add_argument("--device", default="px_9a")
     d.add_argument("--dest", default="downloads")
     d.add_argument("--info", action="store_true", help="only list files/sizes, don't download")
+    d.add_argument("--wait", type=float, default=0.0, metavar="HOURS",
+                   help="keep asking until Play delivers (rate limits come and go), up to HOURS")
+    d.add_argument("--interval", type=float, default=120.0, metavar="SECONDS", help="pause between attempts (--wait)")
     s = sub.add_parser("sample", help="ask N independent sessions which build they are offered")
     s.add_argument("package")
     s.add_argument("-n", type=int, default=10)
-    s.add_argument("--strategy", choices=["devices", "accounts"], default="devices")
+    s.add_argument("--strategy", choices=["devices", "accounts"], default="accounts")
     s.add_argument("--device", default="px_9a")
     w = sub.add_parser("watch", help="one rollout-watch check (run it from a scheduler)")
     w.add_argument("package")
     w.add_argument("--state-dir", default=str(default_cache_dir() / "watch"))
     w.add_argument("--download-dir", default=None)
     w.add_argument("--country", default="US")
-    w.add_argument("--samples", type=int, default=8)
-    w.add_argument("--strategy", choices=["devices", "accounts"], default="devices")
+    w.add_argument("--samples", type=int, default=4, help="fresh sessions per run (default 4)")
+    w.add_argument("--strategy", choices=["devices", "accounts"], default="accounts",
+                   help="accounts (default): Play decides rollouts per account")
+    w.add_argument("--download-wait", type=float, default=10.0, metavar="MINUTES",
+                   help="with --download-dir: keep asking for a new build up to this long per run")
     w.add_argument("--always-sample", action="store_true", help="sample on every run (not only during rollouts)")
     w.add_argument("--no-probe", action="store_true", help="don't ask Play for newer codes by number")
     r = sub.add_parser("report", help="list every build the watcher has seen, with first-seen times")
@@ -88,6 +94,28 @@ async def _tools(argv: list[str]) -> int:
     r.add_argument("--state-dir", default=str(default_cache_dir() / "watch"))
     a = ap.parse_args(argv)
 
+    if a.cmd == "download" and not a.info:
+        from .play.download import fetch_build
+        sf = default_cache_dir() / f"play_session_anon_{a.device}.json"
+        last: dict = {}
+
+        def prog(name, done, total):
+            pct = int(done * 100 / total) if total else 0
+            if last.get(name) != pct // 10:
+                last[name] = pct // 10
+                print(f"    {name}: {pct}%", flush=True)
+
+        async with PlayApiClient(device=a.device, session_file=sf) as c:
+            code = a.vc
+            if code is None:
+                code = (await c.details(a.package)).version_code
+            dest = Path(a.dest) / a.package / str(code)
+            info, paths = await fetch_build(c, a.package, code, dest, wait_hours=a.wait, interval=a.interval,
+                                            progress=prog, log=lambda m: print(m, flush=True))
+            print(("already had" if info is None else "saved + verified") + f" {len(paths)} files in {dest}:")
+            for x in paths:
+                print(f"  {x.name}  {x.stat().st_size:,} bytes")
+        return 0
     if a.cmd == "download":
         sf = default_cache_dir() / f"play_session_anon_{a.device}.json"
         async with PlayApiClient(device=a.device, session_file=sf) as c:
@@ -96,19 +124,6 @@ async def _tools(argv: list[str]) -> int:
                   f"files={len(info.files)} total={info.total_size / 1e6:.1f} MB")
             for f in info.files:
                 print(f"  {f.kind:13} {f.filename:60} {(f.size or 0) / 1e6:9.1f} MB")
-            if not a.info:
-                from .play.download import download_files
-                last = {}
-
-                def prog(name, done, total):
-                    pct = int(done * 100 / total) if total else 0
-                    if last.get(name) != pct // 10:
-                        last[name] = pct // 10
-                        print(f"    {name}: {pct}%", flush=True)
-
-                paths = await download_files(info, Path(a.dest) / a.package / str(info.version_code), c.http,
-                                             progress=prog)
-                print("saved + verified:", *[str(p) for p in paths], sep="\n  ")
     elif a.cmd == "sample":
         rep = await sample_versions(a.package, a.n, strategy=a.strategy, device=a.device)
         print(json.dumps(rep.summary(), indent=2))
@@ -125,7 +140,8 @@ async def _tools(argv: list[str]) -> int:
     else:
         entry = await RolloutWatcher(a.package, a.state_dir, country=a.country, samples=a.samples,
                                      strategy=a.strategy, download_dir=a.download_dir,
-                                     always_sample=a.always_sample, probe=not a.no_probe).check()
+                                     always_sample=a.always_sample, probe=not a.no_probe,
+                                     download_wait_minutes=a.download_wait).check()
         print(json.dumps(entry, indent=2, default=str))
     return 0
 

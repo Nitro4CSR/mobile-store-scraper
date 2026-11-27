@@ -143,4 +143,95 @@ async def download_files(
     return out
 
 
-__all__ = ["DeliveryFile", "DeliveryInfo", "VersionNotAvailable", "parse_delivery", "download_files"]
+def already_downloaded(dest: Path, version_code: int) -> Optional[list[Path]]:
+    """Paths of a complete, verified earlier download of ``version_code`` in ``dest`` (else ``None``)."""
+    try:
+        man = json.loads((dest / "delivery.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if man.get("version_code") != version_code or not man.get("verified"):
+        return None
+    paths = [dest / f["filename"] for f in man.get("files", [])]
+    sizes = [f.get("size") for f in man.get("files", [])]
+    if not paths or any(not p.exists() or (sz is not None and p.stat().st_size != sz) for p, sz in zip(paths, sizes)):
+        return None
+    return paths
+
+
+async def fetch_build(
+    client: Any,
+    package: str,
+    version_code: Optional[int],
+    dest: Path,
+    *,
+    wait_hours: float = 0.0,
+    interval: float = 120.0,
+    files_http: Optional[HttpClient] = None,
+    progress: Optional[ProgressCb] = None,
+    log: Optional[Callable[[str], None]] = None,
+    verify: bool = True,
+    rotate_after: int = 2,
+) -> tuple[Optional[DeliveryInfo], list[Path]]:
+    """Ask Play for ``version_code`` until it delivers (or ``wait_hours`` runs out), then download + verify.
+
+    Each attempt makes ONE quick purchase/delivery request (no long 429 back-off): Google rate limits
+    deliveries on shared anonymous accounts on and off, and simply asking again a few minutes later
+    is what works. Google throttles deliveries PER ACCOUNT, so for anonymous clients a fresh
+    dispenser account is taken after ``rotate_after`` refused attempts in a row (0 = never).
+    Returns ``(None, paths)`` when a verified copy already exists in ``dest``.
+    Raises the last ``StoreScraperError`` when time runs out.
+    """
+    import asyncio
+    import time as _time
+
+    from ..errors import StoreScraperError
+
+    say = log or (lambda m: None)
+    dest = Path(dest)
+    if version_code is not None:
+        done = already_downloaded(dest, version_code)
+        if done:
+            say(f"{package} {version_code} already downloaded and verified in {dest}")
+            return None, done
+    quick = HttpClient(retries=1, backoff=2.0, proxy=None)
+    original = client.http
+    end = _time.monotonic() + wait_hours * 3600
+    attempt = 0
+    refused = 0
+    try:
+        while True:
+            attempt += 1
+            client.http = quick
+            try:
+                info = await client.delivery_info(package, version_code)
+            except StoreScraperError as exc:
+                client.http = original
+                if _time.monotonic() + interval > end:
+                    raise
+                refused += 1
+                rotate = bool(rotate_after) and getattr(client, "anonymous", False) and refused >= rotate_after
+                say(f"attempt {attempt}: {type(exc).__name__}: {str(exc)[:120]} - "
+                    f"{'switching to a fresh account, ' if rotate else ''}retrying in {interval:.0f}s")
+                await asyncio.sleep(interval)
+                if rotate:
+                    try:
+                        await client.login(force=True)
+                        ident = getattr(client, "identity", {}) or {}
+                        say(f"now using account {ident.get('account')} (gsf {ident.get('gsf_id')})")
+                        refused = 0
+                    except StoreScraperError as lexc:
+                        say(f"account switch failed: {type(lexc).__name__}: {str(lexc)[:120]}")
+                continue
+            finally:
+                client.http = original
+            say(f"attempt {attempt}: delivery OK - {len(info.files)} files, {info.total_size / 1e6:.0f} MB")
+            target = dest if version_code is not None else dest.parent / str(info.version_code)
+            paths = await download_files(info, target, files_http or original, verify=verify, progress=progress)
+            return info, paths
+    finally:
+        client.http = original
+        await quick.aclose()
+
+
+__all__ = ["DeliveryFile", "DeliveryInfo", "VersionNotAvailable", "parse_delivery", "download_files",
+           "already_downloaded", "fetch_build"]
