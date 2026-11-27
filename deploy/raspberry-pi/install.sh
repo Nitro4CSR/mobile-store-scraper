@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Log-only Google Play build watcher for a Raspberry Pi (or any Linux box).
 #
+# - logs every build Play offers; with DOWNLOAD_DIR=... also downloads + verifies new builds
 # - never touches the system Python, never uses sudo / apt / systemd
 # - uses the newest /usr/local/bin/python3.N (>= 3.10), or PYTHON=/path/to/python3.x
 # - own venv (default ~/storewatchenv), helper script ~/store_watch.sh, logs in ~/logs
 # - schedules itself in YOUR user's crontab (skip with NO_CRON=1)
 #
 # Usage (all optional, defaults shown):
-#   PACKAGE=com.naturalmotion.customstreetracer2 COUNTRY=DE SAMPLES=6 EVERY_MIN=30 \
+#   PACKAGE=com.naturalmotion.customstreetracer2 COUNTRY=DE SAMPLES=3 EVERY_MIN=30 DOWNLOAD_DIR= \
 #   VENV_PATH=~/storewatchenv DATA_DIR=~/store-watch LOG_DIR=~/logs \
 #   PYTHON=/usr/local/bin/python3.14 REF=<git branch, else install from PyPI> NO_CRON=0 \
 #     bash install.sh
@@ -15,7 +16,8 @@ set -euo pipefail
 
 PACKAGE="${PACKAGE:-com.naturalmotion.customstreetracer2}"
 COUNTRY="${COUNTRY:-DE}"
-SAMPLES="${SAMPLES:-6}"
+SAMPLES="${SAMPLES:-3}"           # fresh anonymous accounts per run (Play rolls out per account)
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-}"  # set (e.g. ~/apks) to auto-download every new build; empty = log only
 EVERY_MIN="${EVERY_MIN:-30}"
 VENV_PATH="${VENV_PATH:-$HOME/storewatchenv}"
 DATA_DIR="${DATA_DIR:-$HOME/store-watch}"
@@ -80,6 +82,7 @@ DATA_DIR="$DATA_DIR"
 LOG_DIR="$LOG_DIR"
 COUNTRY="$COUNTRY"
 SAMPLES="$SAMPLES"
+DOWNLOAD_DIR="$DOWNLOAD_DIR"
 LOCK_FILE="\$DATA_DIR/.store_watch.lock"
 
 PYTHON="\$VENV_PATH/bin/python"
@@ -91,7 +94,8 @@ run_check() {
   {
     echo "=== \$(date '+%F %T') \$PACKAGE (\$(\$PYTHON -V))"
     "\$PYTHON" -m mobile_store_scraper watch "\$PACKAGE" --state-dir "\$DATA_DIR" \\
-        --country "\$COUNTRY" --samples "\$SAMPLES" --always-sample
+        --country "\$COUNTRY" --samples "\$SAMPLES" --always-sample \\
+        \${DOWNLOAD_DIR:+--download-dir "\$DOWNLOAD_DIR" --download-wait 10}
     echo "=== exit \$?"
   } >> "\$LOG_FILE" 2>&1
 }

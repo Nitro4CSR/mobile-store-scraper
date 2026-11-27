@@ -62,6 +62,7 @@ Fields a store doesn't expose are **not defined** on that store's class; for exa
 
 * `downloads`
 * `version_code`, `varies_with_device`, `device_versions`, `version_last_updated`
+* `rollout_in_progress`, `previous_version`, `previous_version_code` (see Staged rollouts)
 * `min_sdk`, `target_sdk`, `download_size`, `offered_by`
 
 **App Store** (`AppStoreApp`): `track_id, bundle_id, seller, seller_url, developer_url, file_size_bytes, supported_devices, ipad_screenshots, appletv_screenshots, languages, genres, genre_ids, advisories, features, content_advisory_rating, score_current_version, ratings_current_version, formatted_price, is_game_center_enabled, kind`
@@ -104,52 +105,81 @@ The API is logged into anonymously with a token from Aurora Store's community di
 ## Download exact APK builds (Google Play)
 
 ```
-mobile-store-scraper download com.google.android.calculator            # what a Pixel 9a is offered
-mobile-store-scraper download com.example.app --device px_tablet --info # list files/sizes only
-mobile-store-scraper download com.example.app --vc 6805204              # ask for a specific version code
+mobile-store-scraper download com.google.android.calculator                       # what a Pixel 9a is offered
+mobile-store-scraper download com.naturalmotion.customstreetracer2 --vc 6905206 --info   # list files/sizes only
+mobile-store-scraper download com.naturalmotion.customstreetracer2 --vc 6905206 --wait 2 # keep trying up to 2 h
 ```
 
-Each download contains the base APK, the split APKs (ABI / density / language), any OBB files and dex metadata. Every file is checked against the size and SHA-1/SHA-256 that Play reports. In Python:
+A download contains everything Play serves for that build: the base APK, split APKs (ABI / density / language), OBB files and dex metadata. Every file is checked against the size and SHA-1/SHA-256 that Play reports, and builds already on disk are skipped. CSR2 6.9.0 for example is 4 files / 1.48 GB: base APK, main + patch OBB and the dex metadata file.
+
+Things learned live (Nov 2026):
+* **Any account can download a build by its version code (`--vc`)**, including a build that is still in a staged rollout and not offered to that account.
+* **Google rate limits downloads per account** (HTTP 429), on and off, especially on the shared anonymous accounts. With `--wait HOURS` the package asks once per `--interval` (default 120 s) and switches to a fresh anonymous account after 2 refusals in a row. That is what gets it through.
+
+In Python:
 
 ```python
 from mobile_store_scraper import PlayApiClient
+from mobile_store_scraper.play.download import fetch_build
+
 async with PlayApiClient(device="px_9a") as c:
-    info, paths = await c.download("com.example.app", "downloads/")
+    info, paths = await fetch_build(c, "com.naturalmotion.customstreetracer2", 6905206,
+                                    "downloads/csr2/6905206", wait_hours=2, interval=120)
 ```
 
 Limits:
 * Only free apps, or apps the logged-in account owns.
-* Play only serves currently live version codes, so old builds can't be fetched.
-* Play Asset Delivery packs (large game content) are not downloaded yet.
+* Play only serves version codes that are live right now (current + rolling out), so old builds can't be fetched.
+* Play Asset Delivery packs are not downloaded yet. CSR2 uses OBBs, which are.
 
-## Catching staged rollouts
+## Staged rollouts
 
-Play rolls a new build out to a growing share of accounts/devices. The tools below log what independent sessions are offered and when:
+During a staged rollout Play gives different answers depending on who asks:
+* The public listing still shows the old version but already has the new "Updated on" date.
+* Accounts inside the rollout get the new build; everyone else gets the old one.
+* **Play decides per account, not per device.** With CSR2 6.9.0, 25 of 25 fresh devices on one account got 6.8.0, while 5 of 10 fresh accounts got 6.9.0.
+
+`scrape()` handles this automatically (`resolve_rollouts=True`):
+* When the listing date is newer than the build the package's account is offered, it asks up to `rollout_samples` (default 20) fresh accounts.
+* It asks them one at a time and stops at the first hit. These are version lookups only, never downloads.
+* Then it reports the newest build:
+
+```python
+app = mss.scrape(store="gp", app="com.naturalmotion.customstreetracer2", country="DE")
+app.version, app.version_code       # '6.9.0', 6905206
+app.version_last_updated            # '2026-11-25T00:00:00Z'
+app.rollout_in_progress             # True
+app.previous_version                # '6.8.0'   (what most users still get)
+```
+
+The account that saw the new build is remembered in `session_dir`, so the next call usually needs no new login (live: 1 login on the first call, 0 on the second). A sweep across all countries searches only once per app.
+
+### Watching for new builds
 
 ```
-mobile-store-scraper sample com.naturalmotion.customstreetracer2 -n 10                 # fresh device ids, one account
-mobile-store-scraper sample com.naturalmotion.customstreetracer2 -n 5 --strategy accounts
 mobile-store-scraper watch  com.naturalmotion.customstreetracer2 --state-dir watch --always-sample
+mobile-store-scraper watch  com.naturalmotion.customstreetracer2 --state-dir watch --always-sample --download-dir apks
 mobile-store-scraper report com.naturalmotion.customstreetracer2 --state-dir watch       # first-seen time per build
+mobile-store-scraper sample com.naturalmotion.customstreetracer2 -n 10                 # one-off: 10 fresh accounts
 ```
 
 `watch` performs one check and is meant to run from a scheduler:
-* It logs every observation to `<package>.observations.csv`.
-* It tracks every build ever seen in `<package>.state.json`.
-* It asks Play for the newest known version code by number (`--no-probe` disables this).
-* It downloads new builds only when you pass `--download-dir`.
+* It samples `--samples` fresh accounts (default 4; `--strategy devices` is still available).
+* It logs every observation to `<package>.observations.csv` and tracks every build ever seen in `<package>.state.json`.
+* It asks Play for the newest known version code by number. This fails fast; `--no-probe` disables it.
+* With `--download-dir` it downloads and verifies every new build, retrying for up to `--download-wait` minutes per run and skipping builds already on disk.
 
-### Raspberry Pi (log-only watcher)
+### Raspberry Pi
 
 The installer leaves the system Python alone and needs no `sudo`, `apt`, `git` or systemd:
-
 * It creates its own venv (`~/storewatchenv`) with the newest `python3.N` in `/usr/local/bin`, or with `PYTHON=/usr/local/bin/python3.14`.
 * It writes a helper script, `~/store_watch.sh`.
-* It adds one line per app to your user's crontab. Your other crontab lines are kept, and the old crontab is backed up first.
+* It adds one line per app to your user's crontab. Your other lines are kept, and the old crontab is backed up first.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/Nitro4CSR/mobile-store-scraper/main/deploy/raspberry-pi/install.sh -o install.sh
-PACKAGE=com.naturalmotion.customstreetracer2 COUNTRY=DE SAMPLES=6 EVERY_MIN=30 bash install.sh
+PACKAGE=com.naturalmotion.customstreetracer2 COUNTRY=DE SAMPLES=3 EVERY_MIN=30 bash install.sh
+DOWNLOAD_DIR=~/apks bash install.sh                 # same, but also download every new build
 
 ~/store_watch.sh report    # every build seen + when it was first seen and how
 ~/store_watch.sh log       # today's run log (~/logs/store_watch_YYYY-MM-DD.log)
@@ -162,7 +192,7 @@ Other options:
 * `REF=<branch>` installs from GitHub instead of PyPI.
 * Running the installer again with another `PACKAGE` watches a second app.
 
-When you notice a new release, `report` shows when the watcher first saw it and how (`main`, `sample:devices` or `probe_by_code`).
+When you notice a new release, `report` shows when the watcher first saw it and how (`main`, `sample:accounts` or `probe_by_code`). Live, the Pi logged CSR2 6.9.0 on Nov 25 at 18:30 UTC, about two days before it was noticed by hand.
 
 ## CLI
 

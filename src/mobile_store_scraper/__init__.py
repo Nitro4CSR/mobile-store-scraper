@@ -17,7 +17,7 @@ from .play import (DEFAULT_DEVICE, REPRESENTATIVE_DEVICES, GooglePlay, PlayApiCl
 from .scrape import (Scraper, resolve_store, scrape, scrape_async, scrape_countries, scrape_countries_async,
                      scrape_many, scrape_many_async)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "scrape", "scrape_async", "scrape_countries", "scrape_countries_async", "scrape_many", "scrape_many_async",
