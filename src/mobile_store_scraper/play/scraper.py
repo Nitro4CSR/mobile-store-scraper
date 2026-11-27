@@ -56,6 +56,13 @@ class GooglePlay:
     Pace: unlimited by default (``concurrency=None, rate_limit=None``). Pass ``concurrency``
     (max simultaneous requests) and/or ``rate_limit`` (requests/second) to slow down.
 
+    ``resolve_rollouts`` (default on, "auto"/"api" modes): during a staged rollout Play shows the
+    OLD version but the NEW "Updated on" date. When the listing date is newer than the build the
+    package's account is offered, up to ``rollout_samples`` fresh accounts are asked (one at a
+    time, stopping at the first hit; version lookups only, no downloads) and ``version`` reports
+    the new build, ``previous_version`` the old one and ``rollout_in_progress`` is set. The account
+    that saw the new build is remembered in ``session_dir`` so later calls need no new logins.
+
     ``api_fallback_on_block=True``: if the web listing is throttled / captcha-blocked, still
     return version + dates from the Android API (country availability then unverified).
 
@@ -81,6 +88,8 @@ class GooglePlay:
         api_concurrency: Optional[int] = None,
         api_cache_ttl: float = 600.0,
         api_fallback_on_block: bool = False,
+        resolve_rollouts: bool = True,
+        rollout_samples: int = 20,
         http: Optional[HttpClient] = None,
         proxy: Optional[str] = None,
     ) -> None:
@@ -103,6 +112,11 @@ class GooglePlay:
         self._api_inflight: dict[tuple[str, str], asyncio.Future] = {}
         self.api_cache_ttl = api_cache_ttl
         self.api_fallback_on_block = api_fallback_on_block
+        self.resolve_rollouts = resolve_rollouts
+        self.rollout_samples = rollout_samples
+        self.rollout_pause = 2.0  # seconds between fresh-account logins while searching a rollout
+        self._rollout_cache: dict[str, tuple[float, Optional[PlayApiDetails]]] = {}
+        self._rollout_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ lifecycle
     async def aclose(self) -> None:
@@ -224,10 +238,89 @@ class GooglePlay:
         )
         # "auto": the API fills what the listing leaves as "Varies with device" (version and/or
         # "Requires Android"); one cached call per app, shared by every country.
-        need_api = mode in ("api", "all_devices") or (mode == "auto" and not (info.version and info.min_os_ver))
+        need_api = mode in ("api", "all_devices") or (mode == "auto" and (
+            self.resolve_rollouts or not (info.version and info.min_os_ver)))
         if need_api:
             await self._apply_api(info, mode)
+            if self.resolve_rollouts and mode in ("auto", "api"):
+                await self._resolve_rollout(info)
         return info
+
+    # ------------------------------------------------------------------ staged rollouts
+    async def _resolve_rollout(self, info: GooglePlayApp) -> None:
+        """Make ``version`` + ``version_last_updated`` describe the NEWEST build during a staged rollout."""
+        from ..appstore import _version_key
+        from ..dates import from_iso
+        d = info.raw.get("api")
+        if not isinstance(d, PlayApiDetails) or not d.version_code:
+            return
+        web_v = (info.raw.get("web") or {}).get("version")
+        # (a) our own account is already in the rollout: the API build is newer than the listing's
+        if web_v and d.version and d.version != web_v and _version_key(d.version) > _version_key(web_v):
+            info.rollout_in_progress = True
+            info.previous_version = web_v
+            info.version, info.version_code = d.version, d.version_code
+            info.version_source = VersionSource.PLAY_API.value
+            return
+        # (b) "Updated on" moved past the build we are offered -> a newer build is rolling out
+        listing, build = from_iso(info.last_updated), d.updated
+        if not (listing and build and listing.date() > build.date()):
+            return
+        info.rollout_in_progress = True
+        newer = await self._find_rollout_build(info.app_id, d.version_code)
+        if newer is None:
+            info.raw["rollout"] = (f"listing updated {listing.date()} but the build offered ({d.version}, "
+                                   f"{build.date()}) is older; newer build not found in {self.rollout_samples} "
+                                   f"fresh accounts")
+            return
+        info.previous_version, info.previous_version_code = d.version, d.version_code
+        info.version, info.version_code = newer.version, newer.version_code
+        info.version_source = VersionSource.PLAY_API.value
+        info.version_last_updated = to_iso(newer.updated)
+        info.raw["rollout_api"] = newer
+
+    async def _find_rollout_build(self, app_id: str, base_code: int) -> Optional[PlayApiDetails]:
+        """Newest build offered to *some* account (cached; at most ``rollout_samples`` new logins)."""
+        hit = self._rollout_cache.get(app_id)
+        if hit and time.monotonic() - hit[0] < self.api_cache_ttl and (hit[1] is None or hit[1].version_code > base_code):
+            return hit[1]
+        lock = self._rollout_locks.setdefault(app_id, asyncio.Lock())
+        async with lock:  # one search per app even when 225 countries ask at once
+            hit = self._rollout_cache.get(app_id)
+            if hit and time.monotonic() - hit[0] < self.api_cache_ttl:
+                return hit[1]
+            found = await self._search_rollout(app_id, base_code)
+            self._rollout_cache[app_id] = (time.monotonic(), found)
+            return found
+
+    async def _search_rollout(self, app_id: str, base_code: int) -> Optional[PlayApiDetails]:
+        from .rollout import client_from_session_file
+        saved = self.session_dir / f"play_rollout_{app_id}.json" if self.session_dir else None
+        # 1) the account that saw the new build last time (no new login)
+        if saved and saved.exists():
+            try:
+                d = await client_from_session_file(saved, self._api_http).details(app_id)
+                if d.version_code and d.version_code > base_code:
+                    return d
+            except StoreScraperError:
+                pass
+            saved.unlink(missing_ok=True)  # expired or no longer useful
+        # 2) fresh anonymous accounts, one at a time, stop at the first hit
+        extra = {"dispenser_url": self._creds["dispenser_url"]} if "dispenser_url" in self._creds else {}
+        for i in range(self.rollout_samples):
+            if i:
+                await asyncio.sleep(self.rollout_pause)
+            c = PlayApiClient(device=self.device, http=self._api_http, **extra)
+            try:
+                d = await c.details(app_id)
+            except StoreScraperError:
+                continue
+            if d.version_code and d.version_code > base_code:
+                if saved and c.session:
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    saved.write_text(c.session.to_json(), encoding="utf-8")
+                return d
+        return None
 
     async def _api_only(self, app_id: str, country: str, lang: str, mode: str, web_exc: Exception) -> GooglePlayApp:
         """Web listing unavailable (throttled/blocked): answer from the Android API alone.

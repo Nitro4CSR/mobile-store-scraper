@@ -114,6 +114,9 @@ class GooglePlayApp(AppData):
     varies_with_device: bool = False
     device_versions: list[DeviceVersion] = field(default_factory=list)
     version_last_updated: Optional[str] = None   # upload date of exactly this build (Play API)
+    rollout_in_progress: bool = False             # staged rollout detected ("Updated on" newer than the build)
+    previous_version: Optional[str] = None        # during a rollout: the build most users still get
+    previous_version_code: Optional[int] = None
     # compatibility --------------------------------------------------------------------
     min_sdk: Optional[int] = None
     target_sdk: Optional[int] = None

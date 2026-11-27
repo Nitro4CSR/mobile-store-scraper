@@ -304,7 +304,7 @@ async def test_scrape_csr2_attributes_match_user_example():
         return httpx.Response(200, text=html)
 
     async with mss.Scraper() as s:
-        s._gp = GooglePlay(http=_mock_http(handler), session_dir=False)
+        s._gp = GooglePlay(http=_mock_http(handler), session_dir=False, resolve_rollouts=False)
         app = await s.scrape(store="gp", app="com.naturalmotion.customstreetracer2", country="DE")
     assert isinstance(app, mss.GooglePlayApp)
     assert app.version == "6.8.0"
@@ -332,7 +332,7 @@ async def test_varies_with_device_filled_from_api():
     def handler(req):
         return httpx.Response(200, text=html)
 
-    gp = GooglePlay(http=_mock_http(handler), session_dir=False)
+    gp = GooglePlay(http=_mock_http(handler), session_dir=False, resolve_rollouts=False)
 
     async def fake(app_id, device=None):
         return api
@@ -394,7 +394,7 @@ async def test_fixed_version_but_varies_min_os_uses_api():
     def handler(req):
         return httpx.Response(200, text=html)
 
-    gp = GooglePlay(http=_mock_http(handler), session_dir=False)
+    gp = GooglePlay(http=_mock_http(handler), session_dir=False, resolve_rollouts=False)
 
     async def fake(app_id, device=None):
         return api
@@ -617,3 +617,78 @@ async def test_fetch_build_rotates_anonymous_account(tmp_path):
     info, paths = await fetch_build(c, "com.x", 42, tmp_path, wait_hours=1, interval=0.01, rotate_after=2, log=msgs.append)
     assert c.calls == 4 and c.logins == 1 and paths
     assert any("switching to a fresh account" in m for m in msgs) and any("now using account new" in m for m in msgs)
+
+
+
+# ----------------------------------------------------------------------------- staged rollout resolution
+def _det(version, code, date):
+    from datetime import datetime, timezone as tz
+    from mobile_store_scraper.play.api import PlayApiDetails
+    y, m, d = map(int, date.split("-"))
+    return PlayApiDetails("com.naturalmotion.customstreetracer2", "CSR 2", "Zynga", version, code,
+                          datetime(y, m, d, tzinfo=tz.utc), date, 36, "50M", "px_9a")
+
+
+def _csr2_gp(monkeypatch, main_det, sample_dets, tmp_path=None, **kw):
+    """GooglePlay over the real CSR2 listing fixture (Updated on 2026-10-14) with a fake Play API."""
+    from mobile_store_scraper.play.api import PlayApiClient
+    html = fixture("play_com.naturalmotion.customstreetracer2_DE_en.html")
+    gp = GooglePlay(http=_mock_http(lambda r: httpx.Response(200, text=html)),
+                    session_dir=tmp_path or False, **kw)
+    gp.rollout_pause = 0
+
+    async def main_api(app_id, device=None):
+        return main_det
+
+    gp.api_details = main_api  # type: ignore[assignment]
+    calls = {"n": 0}
+    queue = list(sample_dets)
+
+    async def sample_details(self, package):
+        calls["n"] += 1
+        return queue.pop(0) if queue else sample_dets[-1]
+
+    monkeypatch.setattr(PlayApiClient, "details", sample_details)
+    return gp, calls
+
+
+async def test_rollout_new_build_found_and_cached(monkeypatch):
+    old, new = _det("6.8.0", 6805204, "2026-10-01"), _det("6.9.0", 6905206, "2026-10-14")
+    gp, calls = _csr2_gp(monkeypatch, old, [old, old, new])
+    app = await gp.app("com.naturalmotion.customstreetracer2", "DE")
+    assert app.rollout_in_progress is True
+    assert (app.version, app.version_code) == ("6.9.0", 6905206)
+    assert (app.previous_version, app.previous_version_code) == ("6.8.0", 6805204)
+    assert app.version_last_updated == "2026-10-14T00:00:00Z" and app.version_source == "play_api"
+    assert calls["n"] == 3                                  # stopped at the first hit
+    await gp.app("com.naturalmotion.customstreetracer2", "US")  # another country: cached, no new logins
+    res = await gp.app_all_countries("com.naturalmotion.customstreetracer2", ["GB", "FR", "JP"])
+    assert all(r.version == "6.9.0" for r in res.values()) and calls["n"] == 3
+    await gp.aclose()
+
+
+async def test_rollout_detected_but_not_found(monkeypatch):
+    old = _det("6.8.0", 6805204, "2026-10-01")
+    gp, calls = _csr2_gp(monkeypatch, old, [old], rollout_samples=20)
+    app = await gp.app("com.naturalmotion.customstreetracer2", "DE")
+    assert app.rollout_in_progress is True and app.version == "6.8.0" and app.previous_version is None
+    assert calls["n"] == 20 and "not found in 20 fresh accounts" in app.raw["rollout"]
+    await gp.aclose()
+
+
+async def test_rollout_own_account_already_on_new_build(monkeypatch):
+    new = _det("6.9.0", 6905206, "2026-10-14")
+    gp, calls = _csr2_gp(monkeypatch, new, [new])
+    app = await gp.app("com.naturalmotion.customstreetracer2", "DE")
+    assert (app.version, app.previous_version, app.rollout_in_progress) == ("6.9.0", "6.8.0", True)
+    assert calls["n"] == 0                                  # no sampling needed
+    await gp.aclose()
+
+
+async def test_no_rollout_when_build_matches_listing(monkeypatch):
+    same = _det("6.8.0", 6805204, "2026-10-14")
+    gp, calls = _csr2_gp(monkeypatch, same, [same])
+    app = await gp.app("com.naturalmotion.customstreetracer2", "DE")
+    assert app.rollout_in_progress is False and app.version == "6.8.0" and app.version_code == 6805204
+    assert calls["n"] == 0
+    await gp.aclose()
